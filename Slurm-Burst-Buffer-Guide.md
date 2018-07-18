@@ -1,0 +1,162 @@
+# Slurm Brust Buffer 指南
+
+- 概览
+- 配置（为系统管理员提供）
+- 作业提交命令
+- 持久Burst Buffer创建和删除指令
+- 交互作业选项
+- 状态命令
+- 高级预约
+
+## 概览
+
+Slurm提供了对Brust Buffer的支持，这是一种共享的高速存储资源。Slurm提供了对该资源的分配，将文件暂存并调度计算节点使用这些资源完成作业，之后再将文件数据从高速存储中移除。Brust buffers也可以在作业生命周期内用作临时文件存储，无需将文件检入检出。另一个典型的用例是将其作为持久存储，与任何特定作业无关。Slurm采用插件的机制为各种类型的burst buffer提供支持，最初提供了两个插件：
+
+1. cray - 使用Cray APIs实现底层管理。
+2. generic - 使用由系统管理员定义的脚本实现底层管理，目前正在开发中。
+
+在Slurm的未来版本中可能会提供其他插件。
+
+Slurm的操作一般遵循以下模式：
+
+1. 读取配置信息和初始状态信息；
+2. 在确定待完成工作的预期开始时间后，将Burst Buffer配给预计即将开始的作业并将所需文件载入；
+3. 文件载入完毕后，为作业分配计算节点并执行；
+4. 作业执行完成后，将文件从Burst Buffer中移除；
+5. 文件移除完毕后，Burst Buffer将被释放同时作业记录被清除。
+
+## 配置（为系统管理员提供）
+
+通过配置slurm.conf文件中的BurstBufferType配置项指定加载管理这些资源的插件以启用Burst Buffer的支持，多个插件可以用逗号进行分隔。使用DebugFlags = BurstBuffer可以启用BurstBuffer的详细使用日志用于调试。BurstBuffer 的DebugFlags（与许多其他DebugFlags一样）会产生非常详细的日志记录，仅用于诊断目的，而不应该用于生产环境。
+
+```txt
+# Excerpt of example slurm.conf file
+BurstBufferType=burst_buffer/generic
+# DebugFlags=BurstBuffer # Commented out
+```
+
+在burst_buffer.conf文件中可定义Burst Buffer配置项，如果配置了多个Burst Buffer插件，则可以为每个插件指定一个独立的配置文件，并在其文件名中包含插件类型，例如，名为"burst_buffer_cray.conf"和"burst_buffer_generic.conf"的文件可以分别由cray和generic burst buffer插件独立使用。此文件可以定义Burst Buffer的使用权限、超时限制以及用于执行各种功能的脚本路径等信息。[TRES limit](https://slurm.schedmd.com/resource_limits.html)可以通过association和QOS进行限制。怼Burst Buffer需求的大小也可以用作优先级限制条件，关于这部分可以参考[multifactor priority](https://slurm.schedmd.com/priority_multifactor.html)文档。
+
+请注意，用于执行burst_buffer / generic插件的突发缓冲区操作的示例脚本包含在Slurm发行版中，但这些脚本旨在用于Slurm开发和测试目的，目前不适合客户使用。欢迎为这些可用脚本/程序做贡献，关于脚本功能的更多信息，请参考Timothy B. Wickberg撰写的[The Ramdisk Storage Accelerator](http://www.k9mach3.org/wickberg-thesis.pdf)。请注意，这些脚本/程序应该以SlurmUser而不是用户root身份执行。有关更多配置信息，请参见burst_buffer.conf手册页。
+
+```txt
+# Excerpt of burst_buffer.conf file for generic plugin
+AllowUsers=alan,brenda
+Flags=EnablePersistent,PrivateData
+Granularity=1GB
+StageInTimeout=30
+StageOutTimeout=30
+#
+GetSysState=/usr/local/slurm/15.08/sbin/GSS
+StartStageIn=/usr/local/slurm/15.08/sbin/SSI
+StartStageOut=/usr/local/slurm/15.08/sbin/SSO
+StopStageIn=/usr/local/slurm/15.08/sbin/PSI
+StopStageOut=/usr/local/slurm/15.08/sbin/PSO
+```
+
+**Cray系统注意事项**：必须安装JSON-C库才能构建Slurm的burst_buffer / cray插件，该插件必须解析JSON格式数据。有关详细信息，请参阅[JSON installation information](https://slurm.schedmd.com/download.html#json)获取更多信息。
+
+## 作业提交命令
+
+正常操作方式是将对Burst Buffer的需求写到批处理脚本中。脚本中包含的"#BB"前缀标识作业对Burst Buffer的需求，以及要存入取出的文件等信息。"#DW"前缀用于标识。有关DataWarp选项的详细信息，请参阅Cray文档。对于DataWarp系统，"#BB"的前缀可用于创建或删除持久性Burst Buffer存储（注意：由于命令由Slurm解释而不是由Cray Datawarp软件解释，因此使用"#BB"前缀）。交互式作业（使用salloc和srun命令提交的作业）可以使用"--bb"或"--bbf"命令行选项指定其Burst Buffer需求，如本文档后面所述。所有"#SBATCH"，"＃DW"和"#BB"指令都应放在脚本的顶部（在任何非注释行之前）。所有持久性Burst Buffer创建和删除都发生在作业的计算开始之前。因此你不能在作业执行的中途检入/检出文件，所有文件检入都发生在作业的计算部分开始之前，并且所有文件检出都在计算完成之后发生。
+
+salloc和srun命令可以创建和使用特定于作业的Burst Buffer。如果选项无效，则作业将被拒绝，并且将直接向用户返回错误消息。请注意，为了保持向后兼容性，可能会忽略无法识别的选项（如果指定的选项被某些版本的Slurm识别但未被其他版本识别，则作业提交不会失败）。如果作业被接受，但稍后失败（例如检入文件失败），则作业将被设置为Held状态并在“Reason”字段中返回底层提供的错误信息。
+
+用户还可以使用“--mail-type = stage_out”或“--mail-type = all”选项获得作业中Burst Buffer相关的通知。电子邮件的主题将是以下形式：
+
+```txt
+SLURM Job_id=12 Name=my_app Staged Out, StageOut time 00:05:07
+```
+
+## 持久性Burst Buffer的创建和删除指令
+
+这些选项用于burst_buffer / cray和burst_buffer / generic插件，以创建和删除持久性Burst Buffer，这些缓冲区的生命周期与作业无关。
+
+- #BB create_persistent name=\<name> capacity=<number> [access=<access>] [pool=<pool> [type=<type>]
+- #BB destroy_persistent name=\<name> [hurry]
+
+持久性Burst Buffer名称不能以数字开头（数字名称保留用于作业特定的突发缓冲区）。容量（大小）规范可以包括后缀“N”（节点），"K|KiB", "M|MiB", "G|GiB", "T|TiB", "P|PiB" （1024的幂），而“KB”，“MB”，“GB”，“TB”，“PB”（1000的幂）。注意：通常Slurm将KB，MB，GB，TB，PB，TB单位解释为1024的幂，但对于Burst Buffers大小规范，Slurm支持IEC / SI格式。这是因为CRAY API支持这两种格式。 access参数标识缓冲区访问模式，burst_buffer / cray插件支持的访问模式包括：striped，private和ldbalance。pool参数标识应该创建Burst Buffer资源池，默认池和可用池取决于配置。type参数标识缓冲区类型。 burst_buffer / cray插件支持的类型模式包括：cache和scratch。可以在单个作业内创建或删除多个持久性Burst Buffer。示例脚本如下：
+
+```txt
+#!/bin/bash
+#BB create_persistent name=alpha capacity=32GB access=striped type=scratch
+#DW jobdw type=scratch capacity=1GB access_mode=striped
+#DW stage_in  type=file source=/home/alan/data.in  destination=$DW_JOB_STRIPED/data
+#DW stage_out type=file destination=/home/alan/data.out source=$DW_JOB_STRIPED/data
+/home/alan/a.out
+```
+
+注意：创建和销毁持久性突发缓冲区的能力可能受burst_buffer.conf文件中“Flags”选项的限制。有关更多信息，请参见burst_buffer.conf手册页。默认情况下，只有[特权用户](https://slurm.schedmd.com/user_permissions.html)（Slurm操作员和管理员）才能创建或销毁持久性突发缓冲区。
+
+## 交互作业选项
+
+交互式作业可以指定创建作业的burst buffer及作业检入的指令，可以使用salloc或srun命令的“--bb”或“--bbf”选项指定这些选项。请注意，不支持使用“--bb”选项支持创建和销毁持久性Burst Buffer。“--bbf”选项将文件名作为参数，该文件应包含与批处理作业相同的Burst Buffer操作指令集，该文件可能包含文件检入指令。或者你可以使用“ - bb”选项指定Burst Buffer指令，这些指令的格式可以与批处理脚本中使用的格式相同（有限的指令集），它们被翻译成等效的脚本供以后处理。多个指令应该是空格分隔的。
+
+- access=\<access>
+- capacity=\<number>
+- swap=\<number>
+- type=\<type>
+- pool=\<name>
+
+如果指定了swap选项，则作业还必须指定所需的节点数量。下面是一个示例命令行，同时展示了由选项生成的等效Burst Buffer脚本：
+
+```txt
+# Sample execute line:
+srun --bb="capacity=1G access=striped type=scratch" a.out
+
+# Equivalent script as generated by Slurm's burst_buffer/cray plugin
+#DW jobdw capacity=1GiB access_mode=striped type=scratch
+```
+
+## 状态命令
+
+可以使用scontrol show burst命令或使用sview命令的Burst Buffer选项获取Slurm的当前Burst Buffer状态信息。示例scontrol输出如下所示。 scontrol“-v”选项可用于更详细的输出格式。
+
+```txt
+$ scontrol show burst
+Name=generic DefaultPool=ssd Granularity=100G TotalSpace=50T UsedSpace=42T
+  StageInTimeout=30 StageOutTimeout=30 Flags=EnablePersistent,PrivateData
+  AllowUsers=alan,brenda
+  CreateBuffer=/usr/local/slurm/17.11/sbin/CB
+  DestroyBuffer=/usr/local/slurm/17.11/sbin/DB
+  GetSysState=/usr/local/slurm/17.11/sbin/GSS
+  StartStageIn=/usr/local/slurm/17.11/sbin/SSI
+  StartStageIn=/usr/local/slurm/17.11/sbin/SSO
+  StopStageIn=/usr/local/slurm/17.11/sbin/PSI
+  StopStageIn=/usr/local/slurm/17.11/sbin/PSO
+  Allocated Buffers:
+    JobID=18 CreateTime=2017-08-19T16:46:05 Pool=dwcache Size=10T State=allocated UserID=alan(1000)
+    JobID=20 CreateTime=2017-08-19T16:46:45 Pool=dwcache Size=10T State=allocated UserID=alan(1000)
+    Name=DB1 CreateTime=2017-08-19T16:46:45 Pool=dwcache Size=22T State=allocated UserID=brenda(1001)
+  Per User Buffer Use:
+    UserID=alan(1000) Used=20T
+    UserID=brenda(1001) Used=22T
+```
+
+## 高级预约
+
+可以使用BurstBuffer选项将Burst Buffer资源配置到高级预留中。该参数包含四个要素：
+
+[plugin:][pool:]#[units]
+
+plugin是突发缓冲区插件名称，目前是“cray”或“generic”。如果未指定插件，则保留适用于所有已配置的突发缓冲区插件。
+
+pool指定Cray通用突发缓冲区资源池。如果未指定“type”，则该数字是存储空间的容量。
+
+units可以是“N”（节点）或者"K|KiB", "M|MiB", "G|GiB", "T|TiB", "P|PiB" （1024的幂），而“KB”，“MB”，“GB”，“TB”，“PB”（1000的幂）。注意：通常Slurm将KB，MB，GB，TB，PB，TB单位解释为1024的幂，但对于Burst Buffers大小规范，Slurm支持IEC / SI格式。这是因为CRAY API支持这两种格式。
+
+使用此预留的作业不仅限于可使用这些预留的Burst Buffer资源，也可以使用这些预留资源加上任何其他资源。一些例子如下：
+
+```txt
+$ scontrol create reservation starttime=now duration=60 \
+  users=alan flags=any_nodes \
+  burstbuffer=cray:100G,generic:20G
+
+$ scontrol create reservation StartTime=noon duration=60 \
+  users=brenda NodeCnt=8 \
+  BurstBuffer=cray:20G
+
+$ scontrol create reservation StartTime=16:00 duration=60 \
+  users=joseph flags=any_nodes \
+  BurstBuffer=cray:pool_test:4G
+```
